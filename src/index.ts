@@ -10,82 +10,115 @@ export interface Options<T> {
   returnOnAbort?: boolean
 }
 
+enum Result {
+  ABORTED,
+  PAYLOAD
+}
+
+type AbortedEvent = {
+  type: Result.ABORTED
+  err: any
+}
+
+type PayloadEvent<T> = {
+  type: Result.PAYLOAD
+  value: IteratorResult<T>
+}
+
+type SourceEvent<T> = AbortedEvent | PayloadEvent<T>
+
 // Wrap an iterator to make it abortable, allow cleanup when aborted via onAbort
 export function abortableSource <T> (source: Source<T>, signal: AbortSignal, options?: Options<T>) {
   const opts: Options<T> = options ?? {}
   const iterator = getIterator<T>(source)
 
-  async function * abortable () {
-    let nextAbortHandler: (() => void) | null
-    const abortHandler = () => {
-      if (nextAbortHandler != null) nextAbortHandler()
+  async function* abortable () {
+    // Catch abort that has happened before
+    if (signal.aborted) {
+      const { abortMessage, abortCode } = opts
+      throw new AbortError(abortMessage, abortCode)
     }
 
-    signal.addEventListener('abort', abortHandler)
+    let done = false
+    let toYield: T | undefined
 
-    while (true) {
-      let result: IteratorResult<T, any>
-      try {
-        if (signal.aborted) {
-          const { abortMessage, abortCode } = opts
-          throw new AbortError(abortMessage, abortCode)
-        }
+    let abortHandler: ((event: any) => void) | undefined
+    const abortPromise = new Promise<AbortedEvent>((resolve) => {
+      abortHandler = (event: any) => {
+        const { abortMessage, abortCode } = opts
+        const err = new AbortError(abortMessage, abortCode)
+        resolve({ type: Result.ABORTED, err})
+      } 
+      signal.addEventListener('abort', abortHandler)
+    })
 
-        const abort = new Promise<any>((resolve, reject) => { // eslint-disable-line no-loop-func
-          nextAbortHandler = () => {
-            const { abortMessage, abortCode } = opts
-            reject(new AbortError(abortMessage, abortCode))
-          }
-        })
+    const nextPayload = async (): Promise<PayloadEvent<T>> => {
+      let payload = await  iterator.next()
 
-        // Race the iterator and the abort signals
-        result = await Promise.race([abort, iterator.next()])
-        nextAbortHandler = null
-      } catch (err: any) {
+      return {
+        type: Result.PAYLOAD,
+        value: payload
+      }
+    }
+
+    const cleanup = () => {
+      done = true
+      if (abortHandler != undefined) {
         signal.removeEventListener('abort', abortHandler)
+      }
+    }
+    while (!done) {
+      const result: SourceEvent<T> = await Promise.race([abortPromise, nextPayload()]) 
 
-        // Might not have been aborted by a known signal
-        const isKnownAborter = err.type === 'aborted' && signal.aborted
+      switch (result.type) {
+        case Result.ABORTED:
+          cleanup()
 
-        if (isKnownAborter && (opts.onAbort != null)) {
-          // Do any custom abort handling for the iterator
-          await opts.onAbort(source)
-        }
+          if (opts.onAbort != null) {
+            await opts.onAbort(source)
+          }
 
-        // End the iterator if it is a generator
-        if (typeof iterator.return === 'function') {
-          try {
-            const p = iterator.return()
+          if (typeof iterator.return === 'function') {
+            try {
+              const p = iterator.return()
 
-            if (p instanceof Promise) { // eslint-disable-line max-depth
-              p.catch(err => {
-                if (opts.onReturnError != null) {
-                  opts.onReturnError(err)
-                }
-              })
-            }
-          } catch (err: any) {
-            if (opts.onReturnError != null) { // eslint-disable-line max-depth
-              opts.onReturnError(err)
+              if (p instanceof Promise) { // eslint-disable-line max-depth
+                p.catch(err => {
+                  if (opts.onReturnError != null) {
+                    opts.onReturnError(err)
+                  }
+                })
+              }
+            } catch (err: any) {
+              if (opts.onReturnError != null) { // eslint-disable-line max-depth
+                opts.onReturnError(err)
+              }
             }
           }
-        }
 
-        if (isKnownAborter && opts.returnOnAbort === true) {
-          return
-        }
+          if (opts.returnOnAbort) {
+            break
+          }
 
-        throw err
+
+          throw result.err
+        case Result.PAYLOAD:
+          if (result.value.done) {
+            cleanup()
+
+            break
+          }
+
+          toYield = result.value.value
+          break
+        default:
+          throw Error(`Invalid result. Received ${JSON.stringify(result)}`)
       }
 
-      if (result.done === true) {
-        break
+      if (toYield) {
+        yield toYield
       }
-
-      yield result.value
     }
-
-    signal.removeEventListener('abort', abortHandler)
   }
 
   return abortable()
